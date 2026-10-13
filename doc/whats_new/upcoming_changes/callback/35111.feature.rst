@@ -1,0 +1,7 @@
+- :class:`compose.ColumnTransformer`, :class:`pipeline.FeatureUnion`,
+  :class:`ensemble.VotingClassifier`, :class:`ensemble.VotingRegressor`,
+  :class:`multioutput.MultiOutputClassifier` and
+  :class:`multioutput.MultiOutputRegressor` now run callbacks during ``fit``
+  and, where that method exists, ``fit_transform``. ``transform`` and
+  ``partial_fit`` are unchanged.
+  By the scikit-learn developers.
