@@ -903,6 +903,24 @@ def test_stacking_final_estimator_attribute_error():
 # ======================
 
 
+def _ignore_cv_response_metadata(estimator, prop):
+    """Do not request ``prop`` on methods ``cross_val_predict`` may call.
+
+    Stacking still forwards only ``fit`` metadata. The response method must
+    explicitly ignore ``prop``; an unset request now raises.
+    """
+    for method_name in (
+        "predict",
+        "predict_proba",
+        "predict_log_proba",
+        "decision_function",
+    ):
+        setter = getattr(estimator, f"set_{method_name}_request", None)
+        if setter is not None:
+            setter(**{prop: False})
+    return estimator
+
+
 @pytest.mark.parametrize(
     "Estimator, Child",
     [
@@ -956,11 +974,17 @@ def test_metadata_routing_for_stacking_estimators(Estimator, Child, prop, prop_v
         [
             (
                 "sub_est1",
-                Child(registry=_Registry()).set_fit_request(**{prop: True}),
+                _ignore_cv_response_metadata(
+                    Child(registry=_Registry()).set_fit_request(**{prop: True}),
+                    prop,
+                ),
             ),
             (
                 "sub_est2",
-                Child(registry=_Registry()).set_fit_request(**{prop: True}),
+                _ignore_cv_response_metadata(
+                    Child(registry=_Registry()).set_fit_request(**{prop: True}),
+                    prop,
+                ),
             ),
         ],
         final_estimator=Child(registry=_Registry()).set_predict_request(**{prop: True}),

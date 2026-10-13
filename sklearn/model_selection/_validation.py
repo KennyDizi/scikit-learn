@@ -1084,10 +1084,25 @@ def cross_val_predict(
         The verbosity level.
 
     params : dict, default=None
-        Parameters to pass to the underlying estimator's ``fit`` and the CV
-        splitter.
+        Parameters to pass to the underlying estimator's ``fit``, the method
+        given by ``method``, and the CV splitter.
+
+        With metadata routing enabled
+        (``sklearn.set_config(enable_metadata_routing=True)``), each entry is
+        delivered only to the consumers that request it. Aliases set with
+        ``set_{method}_request`` are resolved per consumer method. Metadata
+        requested for ``fit`` is sliced with the training indices, and metadata
+        requested for ``method`` is sliced with the test indices. Values that
+        do not describe one row of ``X`` are passed through unchanged.
+
+        With metadata routing disabled, ``params`` are passed to ``fit`` only.
+        The ``groups`` argument is passed only to the CV splitter.
 
         .. versionadded:: 1.4
+
+        .. versionchanged:: 1.10
+            Requested metadata is routed to ``method`` and sliced with the
+            test indices when metadata routing is enabled.
 
     pre_dispatch : int or str, default='2*n_jobs'
         Controls the number of jobs that get dispatched during parallel
@@ -1152,34 +1167,36 @@ def cross_val_predict(
     params = {} if params is None else params
 
     if _routing_enabled():
-        # For estimators, a MetadataRouter is created in get_metadata_routing
-        # methods. For these router methods, we create the router to use
-        # `process_routing` on it.
+        # Fit, the selected response method, and the splitter each keep their
+        # own method mapping so requests and aliases are resolved independently
+        # instead of forwarding the raw ``params`` dict. ``fit`` is registered
+        # before the response method so an unset ``fit`` request is still
+        # reported first.
+        splitter_mapping = MethodMapping().add(caller="fit", callee="split")
+        estimator_mapping = (
+            MethodMapping()
+            .add(caller="fit", callee="fit")
+            .add(caller="fit", callee=method)
+        )
         router = (
             MetadataRouter(owner="cross_val_predict")
-            .add(
-                splitter=cv,
-                method_mapping=MethodMapping().add(caller="fit", callee="split"),
-            )
-            .add(
-                estimator=estimator,
-                # TODO(SLEP6): also pass metadata for the predict method.
-                method_mapping=MethodMapping().add(caller="fit", callee="fit"),
-            )
+            .add(splitter=cv, method_mapping=splitter_mapping)
+            .add(estimator=estimator, method_mapping=estimator_mapping)
         )
         try:
             routed_params = process_routing(router, "fit", **params)
         except UnsetMetadataPassedError as e:
-            # The default exception would mention `fit` since in the above
-            # `process_routing` code, we pass `fit` as the caller. However,
-            # the user is not calling `fit` directly, so we change the message
-            # to make it more suitable for this case.
+            # ``process_routing`` names the router caller ``fit``. Users call
+            # ``cross_val_predict``, including when the unset request belongs
+            # to the response method rather than ``fit``.
             raise UnsetMetadataPassedError(
                 message=str(e).replace("cross_val_predict.fit", "cross_val_predict"),
                 unrequested_params=e.unrequested_params,
                 routed_params=e.routed_params,
             )
     else:
+        # ``params`` stay fit-only. ``groups`` stays on the splitter. The
+        # response method is intentionally left empty.
         routed_params = _manual_routing(
             {
                 "splitter": {"split": {"groups": groups}},
@@ -1217,6 +1234,9 @@ def cross_val_predict(
     # We clone the estimator to make sure that all the folds are
     # independent, and that it is pickle-able.
     parallel = Parallel(n_jobs=n_jobs, verbose=verbose, pre_dispatch=pre_dispatch)
+    # Resolved per method above; sliced inside ``_fit_and_predict``.
+    fit_params = routed_params.estimator.fit
+    method_params = routed_params.estimator[method]
     predictions = parallel(
         delayed(_fit_and_predict)(
             clone(estimator),
@@ -1224,8 +1244,9 @@ def cross_val_predict(
             y,
             train,
             test,
-            routed_params.estimator.fit,
+            fit_params,
             method,
+            method_params,
         )
         for train, test in splits
     )
@@ -1258,7 +1279,7 @@ def cross_val_predict(
         return predictions[inv_test_indices]
 
 
-def _fit_and_predict(estimator, X, y, train, test, fit_params, method):
+def _fit_and_predict(estimator, X, y, train, test, fit_params, method, method_params):
     """Fit estimator and predict values for a given dataset split.
 
     Read more in the :ref:`User Guide <cross_validation>`.
@@ -1282,19 +1303,27 @@ def _fit_and_predict(estimator, X, y, train, test, fit_params, method):
         Indices of test samples.
 
     fit_params : dict or None
-        Parameters that will be passed to ``estimator.fit``.
+        Parameters passed to ``estimator.fit``. Sample-aligned values are
+        sliced with ``train`` against the original ``X``.
 
     method : str
         Invokes the passed method name of the passed estimator.
+
+    method_params : dict or None
+        Parameters passed to the selected response method. Sample-aligned
+        values are sliced with ``test`` against the original ``X``.
 
     Returns
     -------
     predictions : sequence
         Result of calling 'estimator.method'
     """
-    # Adjust length of sample weights
+    # Slice against the original ``X``. Values that are not sample-aligned
+    # pass through unchanged, which is the ``_check_method_params`` contract.
     fit_params = fit_params if fit_params is not None else {}
     fit_params = _check_method_params(X, params=fit_params, indices=train)
+    method_params = method_params if method_params is not None else {}
+    method_params = _check_method_params(X, params=method_params, indices=test)
 
     X_train, y_train = _safe_split(estimator, X, y, train)
     X_test, _ = _safe_split(estimator, X, y, test, train)
@@ -1304,7 +1333,7 @@ def _fit_and_predict(estimator, X, y, train, test, fit_params, method):
     else:
         estimator.fit(X_train, y_train, **fit_params)
     func = getattr(estimator, method)
-    predictions = func(X_test)
+    predictions = func(X_test, **method_params)
 
     encode = (
         method in ["decision_function", "predict_proba", "predict_log_proba"]

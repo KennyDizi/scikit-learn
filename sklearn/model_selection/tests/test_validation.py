@@ -13,6 +13,7 @@ from scipy.sparse import issparse
 
 from sklearn import config_context
 from sklearn.base import BaseEstimator, ClassifierMixin, clone, is_classifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.datasets import (
     load_diabetes,
@@ -23,7 +24,11 @@ from sklearn.datasets import (
     make_regression,
 )
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    StackingClassifier,
+    StackingRegressor,
+)
 from sklearn.exceptions import FitFailedWarning, UnsetMetadataPassedError
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
@@ -69,6 +74,7 @@ from sklearn.model_selection._validation import (
 from sklearn.model_selection.tests.common import OneTimeSplitter
 from sklearn.model_selection.tests.test_search import FailingClassifier
 from sklearn.multiclass import OneVsRestClassifier
+from sklearn.multioutput import ClassifierChain, RegressorChain
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
@@ -76,6 +82,7 @@ from sklearn.preprocessing import LabelEncoder, scale
 from sklearn.svm import SVC, LinearSVC
 from sklearn.tests.metadata_routing_common import (
     ConsumingClassifier,
+    ConsumingRegressor,
     ConsumingScorer,
     ConsumingSplitter,
     _Registry,
@@ -2666,6 +2673,451 @@ def test_learning_curve_exploit_incremental_learning_routing():
             sample_weight=fit_sample_weight,
             metadata=fit_metadata,
         )
+
+
+_RESPONSE_METHODS = (
+    "predict",
+    "predict_proba",
+    "predict_log_proba",
+    "decision_function",
+)
+
+
+class _SharedRecords:
+    """Mutable bag shared by cloned estimators and splitters."""
+
+    def __init__(self):
+        self.fit_rows = []
+        self.fit_weights = []
+        self.predict_rows = []
+        self.predict_weights = []
+        self.groups = []
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
+
+class _RowConsumingClassifier(ConsumingClassifier):
+    """Record the rows ``fit`` and the response method actually saw."""
+
+    def fit(self, X, y, sample_weight="default", metadata="default"):
+        self.fit_rows_ = np.asarray(X)
+        return super().fit(X, y, sample_weight=sample_weight, metadata=metadata)
+
+    def _remember_predict_rows(self, X):
+        self.predict_rows_ = np.asarray(X)
+
+    def predict(self, X, sample_weight="default", metadata="default"):
+        self._remember_predict_rows(X)
+        return super().predict(X, sample_weight=sample_weight, metadata=metadata)
+
+    def predict_proba(self, X, sample_weight="default", metadata="default"):
+        self._remember_predict_rows(X)
+        return super().predict_proba(X, sample_weight=sample_weight, metadata=metadata)
+
+    def predict_log_proba(self, X, sample_weight="default", metadata="default"):
+        self._remember_predict_rows(X)
+        return super().predict_log_proba(
+            X, sample_weight=sample_weight, metadata=metadata
+        )
+
+    def decision_function(self, X, sample_weight="default", metadata="default"):
+        self._remember_predict_rows(X)
+        return super().decision_function(
+            X, sample_weight=sample_weight, metadata=metadata
+        )
+
+
+class _RowConsumingRegressor(ConsumingRegressor):
+    """Regressor variant of :class:`_RowConsumingClassifier`."""
+
+    def fit(self, X, y, sample_weight="default", metadata="default"):
+        self.fit_rows_ = np.asarray(X)
+        return super().fit(X, y, sample_weight=sample_weight, metadata=metadata)
+
+    def predict(self, X, y=None, sample_weight="default", metadata="default"):
+        self.predict_rows_ = np.asarray(X)
+        return super().predict(X, y=y, sample_weight=sample_weight, metadata=metadata)
+
+
+class _GroupRecordingKFold(KFold):
+    def __init__(self, store, n_splits=2):
+        super().__init__(n_splits=n_splits)
+        self.store = store
+
+    def split(self, X, y=None, groups=None):
+        self.store.groups.append(groups)
+        return super().split(X, y, groups)
+
+
+class _WeightRecordingEstimator(ClassifierMixin, BaseEstimator):
+    """Accept ``sample_weight`` on ``fit`` only when it is actually passed.
+
+    ``predict`` records a sentinel when ``sample_weight`` is omitted, which is
+    distinct from an explicit ``None``.
+    """
+
+    def __init__(self, store):
+        self.store = store
+
+    def fit(self, X, y, sample_weight=None):
+        self.classes_ = np.unique(y)
+        self.store.fit_rows.append(np.asarray(X))
+        self.store.fit_weights.append(sample_weight)
+        return self
+
+    def predict(self, X, sample_weight="missing"):
+        self.store.predict_rows.append(np.asarray(X))
+        self.store.predict_weights.append(sample_weight)
+        return np.zeros(len(X), dtype=int)
+
+
+def _row_indices(reference, rows):
+    positions = {
+        tuple(row.tolist()): index for index, row in enumerate(np.asarray(reference))
+    }
+    return np.asarray([positions[tuple(row.tolist())] for row in np.asarray(rows)])
+
+
+def _routing_xy(n_samples=12):
+    X = np.arange(n_samples * 2, dtype=np.int64).reshape(n_samples, 2)
+    y = np.array([0, 1] * (n_samples // 2))
+    # Distinct per-row values. With ``n_splits=2`` each side has the same
+    # length, so a shape check cannot tell a train slice from a test slice.
+    fit_weight = np.arange(n_samples, dtype=float) + 1.0
+    predict_weight = np.arange(n_samples, dtype=float) + 1000.0
+    return X, y, fit_weight, predict_weight
+
+
+def _mapping_pairs(router, name):
+    return [(pair.caller, pair.callee) for pair in router._route_mappings[name].mapping]
+
+
+def _records(estimator, method):
+    found = []
+    for records in getattr(estimator, "_records", {}).get(method, {}).values():
+        found.extend(records)
+    return found
+
+
+@pytest.mark.parametrize("method", _RESPONSE_METHODS)
+@pytest.mark.parametrize("kind", ["requested", "ignored", "aliased"])
+@config_context(enable_metadata_routing=True)
+def test_cross_val_predict_routes_metadata_by_method(method, kind):
+    """Route response-method metadata independently of ``fit``.
+
+    ``n_splits=2`` makes every train block the same length as its test block.
+    Expected values come from the rows each call received, so using the other
+    index set still fails.
+    """
+    X, y, fit_weight, predict_weight = _routing_xy()
+    registry = _Registry()
+    estimator = _RowConsumingClassifier(registry=registry)
+    if kind == "aliased":
+        estimator.set_fit_request(sample_weight="fit_sample_weight", metadata=False)
+        getattr(estimator, f"set_{method}_request")(
+            sample_weight="predict_sample_weight", metadata=False
+        )
+        params = {
+            "fit_sample_weight": fit_weight,
+            "predict_sample_weight": predict_weight,
+        }
+    elif kind == "ignored":
+        # ``fit`` consumes both values. The response method opts out, so it
+        # must not see them. A ``False`` request is not a valid argument unless
+        # another consumer still requests that metadata.
+        estimator.set_fit_request(sample_weight=True, metadata=True)
+        getattr(estimator, f"set_{method}_request")(sample_weight=False, metadata=False)
+        params = {"sample_weight": fit_weight, "metadata": predict_weight}
+    else:
+        estimator.set_fit_request(sample_weight=True, metadata=False)
+        getattr(estimator, f"set_{method}_request")(sample_weight=True, metadata=True)
+        params = {"sample_weight": fit_weight, "metadata": predict_weight}
+
+    predictions = cross_val_predict(
+        estimator,
+        X,
+        y,
+        cv=KFold(n_splits=2),
+        method=method,
+        n_jobs=1,
+        params=params,
+    )
+    if method in ("predict", "decision_function"):
+        assert predictions.shape == (X.shape[0],)
+    else:
+        assert predictions.shape == (X.shape[0], 2)
+
+    assert len(registry) == 2
+    covered = []
+    for fitted in registry:
+        fit_idx = _row_indices(X, fitted.fit_rows_)
+        predict_idx = _row_indices(X, fitted.predict_rows_)
+        # Same length on purpose: equality has to come from the values.
+        assert fit_idx.shape == predict_idx.shape
+        assert set(fit_idx.tolist()).isdisjoint(predict_idx.tolist())
+        assert not np.array_equal(fit_weight[fit_idx], fit_weight[predict_idx])
+        covered.append(predict_idx)
+
+        fit_record = fitted._records["fit"]["cross_val_predict"][0]
+        predict_record = fitted._records[method]["cross_val_predict"][0]
+        assert_array_equal(fit_record["sample_weight"], fit_weight[fit_idx])
+        if kind == "ignored":
+            assert set(fit_record) == {"sample_weight", "metadata"}
+            assert predict_record == {}
+            assert_array_equal(fit_record["metadata"], predict_weight[fit_idx])
+        elif kind == "aliased":
+            assert set(fit_record) == {"sample_weight"}
+            assert set(predict_record) == {"sample_weight"}
+            assert_array_equal(
+                predict_record["sample_weight"], predict_weight[predict_idx]
+            )
+        else:
+            assert set(fit_record) == {"sample_weight"}
+            assert set(predict_record) == {"sample_weight", "metadata"}
+            assert_array_equal(predict_record["sample_weight"], fit_weight[predict_idx])
+            assert_array_equal(predict_record["metadata"], predict_weight[predict_idx])
+    assert sorted(np.concatenate(covered).tolist()) == list(range(X.shape[0]))
+
+
+@pytest.mark.parametrize("method", _RESPONSE_METHODS)
+@config_context(enable_metadata_routing=True)
+def test_cross_val_predict_unset_response_metadata(method):
+    """Unset response-method requests raise with ``cross_val_predict`` as caller."""
+    X, y, fit_weight, _ = _routing_xy()
+    estimator = ConsumingClassifier().set_fit_request(sample_weight=True)
+    with pytest.raises(UnsetMetadataPassedError) as exc_info:
+        cross_val_predict(
+            estimator,
+            X,
+            y,
+            cv=KFold(n_splits=2),
+            method=method,
+            n_jobs=1,
+            params={"sample_weight": fit_weight},
+        )
+    message = str(exc_info.value)
+    assert "[sample_weight] are passed but are not explicitly set as requested" in (
+        message
+    )
+    assert f"ConsumingClassifier.{method}" in message
+    assert "which is used within cross_val_predict." in message
+    assert "cross_val_predict.fit" not in message
+    assert f"set_{method}_request" in message
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["routing-token", np.array([3.0, 5.0, 7.0])],
+    ids=["string", "short-array"],
+)
+@config_context(enable_metadata_routing=True)
+def test_cross_val_predict_non_sample_metadata_passthrough(metadata):
+    """Non-sample metadata keeps its identity on both ``fit`` and ``predict``."""
+    X, y, fit_weight, _ = _routing_xy()
+    registry = _Registry()
+    estimator = (
+        _RowConsumingClassifier(registry=registry)
+        .set_fit_request(sample_weight=True, metadata=True)
+        .set_predict_request(sample_weight=True, metadata=True)
+    )
+    cross_val_predict(
+        estimator,
+        X,
+        y,
+        cv=KFold(n_splits=2),
+        n_jobs=1,
+        params={"sample_weight": fit_weight, "metadata": metadata},
+    )
+    assert len(registry) == 2
+    for fitted in registry:
+        fit_idx = _row_indices(X, fitted.fit_rows_)
+        predict_idx = _row_indices(X, fitted.predict_rows_)
+        fit_record = fitted._records["fit"]["cross_val_predict"][0]
+        predict_record = fitted._records["predict"]["cross_val_predict"][0]
+        assert fit_record["metadata"] is metadata
+        assert predict_record["metadata"] is metadata
+        assert_array_equal(fit_record["sample_weight"], fit_weight[fit_idx])
+        assert_array_equal(predict_record["sample_weight"], fit_weight[predict_idx])
+
+
+@config_context(enable_metadata_routing=False)
+def test_cross_val_predict_disabled_routing_params_and_groups():
+    """With routing off, ``params`` stay on ``fit`` and ``groups`` on ``split``."""
+    X, y, fit_weight, _ = _routing_xy()
+    groups = np.arange(X.shape[0]) % 2
+    store = _SharedRecords()
+    estimator = _WeightRecordingEstimator(store)
+    cross_val_predict(
+        estimator,
+        X,
+        y,
+        groups=groups,
+        cv=_GroupRecordingKFold(store, n_splits=2),
+        n_jobs=1,
+        params={"sample_weight": fit_weight},
+    )
+    assert len(store.groups) == 1
+    assert_array_equal(store.groups[0], groups)
+    assert len(store.fit_rows) == 2
+    assert len(store.predict_rows) == 2
+    assert store.predict_weights == ["missing", "missing"]
+    for rows, weight in zip(store.fit_rows, store.fit_weights):
+        assert_array_equal(weight, fit_weight[_row_indices(X, rows)])
+
+
+@pytest.mark.parametrize(
+    "metaestimator_factory, method_name, router_key",
+    [
+        (
+            lambda estimator: StackingClassifier(
+                estimators=[("est", estimator)],
+                final_estimator=LogisticRegression(),
+                cv=KFold(n_splits=2),
+                n_jobs=1,
+            ),
+            "predict_proba",
+            "est",
+        ),
+        (
+            lambda estimator: StackingRegressor(
+                estimators=[("est", estimator)],
+                final_estimator=Ridge(),
+                cv=KFold(n_splits=2),
+                n_jobs=1,
+            ),
+            "predict",
+            "est",
+        ),
+        (
+            lambda estimator: CalibratedClassifierCV(
+                estimator,
+                method="sigmoid",
+                cv=KFold(n_splits=2),
+                ensemble=False,
+                n_jobs=1,
+            ),
+            "predict_proba",
+            "estimator",
+        ),
+    ],
+    ids=["stacking-classifier", "stacking-regressor", "calibration"],
+)
+@config_context(enable_metadata_routing=True)
+def test_cross_val_predict_callers_slice_requested_metadata(
+    metaestimator_factory, method_name, router_key
+):
+    """Stacking and calibration reuse ``fit`` params without new router entries.
+
+    Their outer routers still map only ``fit``. ``cross_val_predict`` resolves
+    the response-method request itself and slices with the test rows.
+    """
+    X, y, fit_weight, _ = _routing_xy()
+    registry = _Registry()
+    if method_name == "predict":
+        y = fit_weight.copy()
+        estimator = _RowConsumingRegressor(registry=registry)
+    else:
+        estimator = _RowConsumingClassifier(registry=registry)
+    estimator.set_fit_request(sample_weight=True)
+    getattr(estimator, f"set_{method_name}_request")(sample_weight=True)
+    metaestimator = metaestimator_factory(estimator)
+    assert _mapping_pairs(metaestimator.get_metadata_routing(), router_key) == [
+        ("fit", "fit")
+    ]
+
+    metaestimator.fit(X, y, sample_weight=fit_weight)
+
+    cv_estimators = [est for est in registry if _records(est, method_name)]
+    full_estimators = [est for est in registry if not _records(est, method_name)]
+    assert len(cv_estimators) == 2
+    assert len(full_estimators) == 1
+    full_weight = _records(full_estimators[0], "fit")[0]["sample_weight"]
+    assert_array_equal(full_weight, fit_weight)
+    covered = []
+    for fitted in cv_estimators:
+        fit_idx = _row_indices(X, fitted.fit_rows_)
+        predict_idx = _row_indices(X, fitted.predict_rows_)
+        assert fit_idx.shape == predict_idx.shape
+        assert set(fit_idx.tolist()).isdisjoint(predict_idx.tolist())
+        assert not np.array_equal(fit_weight[fit_idx], fit_weight[predict_idx])
+        fit_record = _records(fitted, "fit")[0]["sample_weight"]
+        assert_array_equal(fit_record, fit_weight[fit_idx])
+        assert_array_equal(
+            _records(fitted, method_name)[0]["sample_weight"], fit_weight[predict_idx]
+        )
+        covered.append(predict_idx)
+    assert sorted(np.concatenate(covered).tolist()) == list(range(X.shape[0]))
+
+
+@config_context(enable_metadata_routing=True)
+def test_stacking_unset_response_request_names_cross_val_predict():
+    """An unset stacking response request surfaces as a ``cross_val_predict`` error."""
+    X, y, fit_weight, _ = _routing_xy()
+    stack = StackingClassifier(
+        estimators=[("est", ConsumingClassifier().set_fit_request(sample_weight=True))],
+        cv=KFold(n_splits=2),
+        n_jobs=1,
+    )
+    assert _mapping_pairs(stack.get_metadata_routing(), "est") == [("fit", "fit")]
+    with pytest.raises(UnsetMetadataPassedError) as exc_info:
+        stack.fit(X, y, sample_weight=fit_weight)
+    message = str(exc_info.value)
+    assert "ConsumingClassifier.predict_proba" in message
+    assert "which is used within cross_val_predict." in message
+    assert "cross_val_predict.fit" not in message
+    assert "set_predict_proba_request" in message
+
+
+@pytest.mark.parametrize(
+    "chain_cls, chain_method",
+    [
+        (ClassifierChain, "predict"),
+        (ClassifierChain, "predict_proba"),
+        (ClassifierChain, "predict_log_proba"),
+        (ClassifierChain, "decision_function"),
+        (RegressorChain, "predict"),
+    ],
+)
+@config_context(enable_metadata_routing=True)
+def test_chain_does_not_forward_metadata_to_cross_val_predict(chain_cls, chain_method):
+    """Chains keep a fit-only router and do not pass ``params`` into CV predict."""
+    X, _, sample_weight, _ = _routing_xy()
+    registry = _Registry()
+    if chain_cls is ClassifierChain:
+        estimator = ConsumingClassifier(registry=registry)
+        Y = np.column_stack([np.array([0, 1] * 6), np.array([1, 0] * 6)])
+        chain = chain_cls(estimator, cv=2, chain_method=chain_method)
+    else:
+        estimator = ConsumingRegressor(registry=registry)
+        Y = np.column_stack([np.arange(X.shape[0]), np.arange(X.shape[0])[::-1]])
+        chain = chain_cls(estimator, cv=2)
+    estimator.set_fit_request(sample_weight=True)
+    getattr(estimator, f"set_{chain_method}_request")(sample_weight=True)
+    assert _mapping_pairs(chain.get_metadata_routing(), "estimator") == [("fit", "fit")]
+
+    chain.fit(X, Y, sample_weight=sample_weight)
+
+    response_records = []
+    weighted_fits = []
+    unweighted_fits = []
+    for fitted in registry:
+        for record in _records(fitted, "fit"):
+            if "sample_weight" in record:
+                weighted_fits.append(record["sample_weight"])
+            else:
+                unweighted_fits.append(record)
+        response_records.extend(_records(fitted, chain_method))
+    assert weighted_fits
+    assert unweighted_fits
+    for value in weighted_fits:
+        assert_array_equal(value, sample_weight)
+    assert response_records
+    for record in response_records:
+        assert "sample_weight" not in record
 
 
 # End of metadata routing tests
