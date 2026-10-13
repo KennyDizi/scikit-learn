@@ -17,7 +17,13 @@ import numpy as np
 from scipy import sparse
 
 from sklearn.base import TransformerMixin, _fit_context, clone
-from sklearn.pipeline import _fit_transform_one, _name_estimators, _transform_one
+from sklearn.callback import CallbackSupportMixin
+from sklearn.pipeline import (
+    _callback_metadata,
+    _fit_transform_one_with_callbacks,
+    _name_estimators,
+    _transform_one,
+)
 from sklearn.preprocessing import FunctionTransformer
 from sklearn.utils import Bunch
 from sklearn.utils._indexing import (
@@ -61,7 +67,7 @@ _ERR_MSG_1DCOLUMN = (
 )
 
 
-class ColumnTransformer(TransformerMixin, _BaseComposition):
+class ColumnTransformer(CallbackSupportMixin, TransformerMixin, _BaseComposition):
     """Applies transformers to columns of an array or pandas DataFrame.
 
     This estimator allows different columns or column subsets of the input
@@ -697,7 +703,7 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
         ----------
         transformers : list of estimators
             The fitted estimators as the output of
-            `self._call_func_on_transformers(func=_fit_transform_one, ...)`.
+            ``self._call_func_on_transformers(...)`` during fit.
             That function doesn't include 'drop' or transformers for which no
             column is selected. 'drop' is kept as is, and for the no-column
             transformers the unfitted transformer is put in
@@ -808,7 +814,17 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
             return None
         return "(%d of %d) Processing %s" % (idx, total, name)
 
-    def _call_func_on_transformers(self, X, y, func, column_as_labels, routed_params):
+    def _call_func_on_transformers(
+        self,
+        X,
+        y,
+        func,
+        column_as_labels,
+        routed_params,
+        *,
+        callback_ctx=None,
+        metadata=None,
+    ):
         """
         Private function to fit and/or transform on demand.
 
@@ -821,8 +837,9 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
             Targets.
 
         func : callable
-            Function to call, which can be _fit_transform_one or
-            _transform_one.
+            Function to call. ``_transform_one`` selects the transform path.
+            Any other value selects the fit path, which clones each transformer
+            and runs it with callback propagation.
 
         column_as_labels : bool
             Used to iterate through transformers. If True, columns are returned
@@ -838,48 +855,76 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
         Return value (transformers and/or transformed X data) depends
         on the passed function.
         """
-        if func is _fit_transform_one:
-            fitted = False
-        else:  # func is _transform_one
-            fitted = True
+        fitting = func is not _transform_one
 
         transformers = list(
             self._iter(
-                fitted=fitted,
+                fitted=not fitting,
                 column_as_labels=column_as_labels,
                 skip_drop=True,
                 skip_empty_columns=True,
             )
         )
         try:
+            # Create every subcontext before dispatch. Doing it inside the
+            # generator can mutate the parent context while joblib pickles it.
+            if fitting:
+                if len(transformers) != callback_ctx.max_subtasks:
+                    raise RuntimeError(
+                        "ColumnTransformer callback context was created for "
+                        f"{callback_ctx.max_subtasks} transformers but "
+                        f"{len(transformers)} will be fitted."
+                    )
+                subcontexts = [
+                    callback_ctx.subcontext(
+                        task_name=f"fit-transform-{name}", task_id=idx
+                    )
+                    for idx, (name, _, _, _) in enumerate(transformers)
+                ]
             jobs = []
-            for idx, (name, trans, columns, weight) in enumerate(transformers, start=1):
-                if func is _fit_transform_one:
-                    if trans == "passthrough":
+            for idx, (name, trans, columns, weight) in enumerate(transformers):
+                columns_x = _safe_indexing(X, columns, axis=1)
+                if fitting:
+                    # "passthrough" is not a user estimator. Record the task
+                    # without propagating callbacks onto the temporary wrapper.
+                    propagate = trans != "passthrough"
+                    if not propagate:
                         output_config = _get_output_config("transform", self)
                         trans = FunctionTransformer(
                             accept_sparse=True,
                             check_inverse=False,
                             feature_names_out="one-to-one",
                         ).set_output(transform=output_config["dense"])
-
-                    extra_args = dict(
-                        message_clsname="ColumnTransformer",
-                        message=self._log_message(name, idx, len(transformers)),
+                    # Clone first, then let the worker attach callbacks.
+                    jobs.append(
+                        delayed(_fit_transform_one_with_callbacks)(
+                            clone(trans),
+                            columns_x,
+                            y,
+                            weight,
+                            message_clsname="ColumnTransformer",
+                            message=self._log_message(name, idx + 1, len(transformers)),
+                            params=routed_params[name],
+                            caller=self,
+                            callback_ctx=subcontexts[idx],
+                            metadata=metadata,
+                            propagate=propagate,
+                        )
                     )
-                else:  # func is _transform_one
-                    extra_args = {}
-                jobs.append(
-                    delayed(func)(
-                        transformer=clone(trans) if not fitted else trans,
-                        X=_safe_indexing(X, columns, axis=1),
-                        y=y,
-                        weight=weight,
-                        **extra_args,
-                        params=routed_params[name],
+                else:
+                    jobs.append(
+                        delayed(_transform_one)(
+                            trans,
+                            columns_x,
+                            y,
+                            weight,
+                            params=routed_params[name],
+                        )
                     )
-                )
 
+            # Stop requests are advisory once this batch has been dispatched:
+            # sibling tasks are not cancelled, and worker-local callback state
+            # is not copied back onto the parent.
             return Parallel(n_jobs=self.n_jobs)(jobs)
 
         except ValueError as e:
@@ -888,6 +933,10 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
             else:
                 raise
 
+    @_fit_context(
+        # estimators in ColumnTransformer.transformers are not validated yet
+        prefer_skip_nested_validation=False
+    )
     def fit(self, X, y=None, **params):
         """Fit all transformers using X.
 
@@ -915,9 +964,10 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
             This estimator.
         """
         _raise_for_params(params, self, "fit")
-        # we use fit_transform to make sure to set sparse_output_ (for which we
-        # need the transformed data) to have consistent output type in predict
-        self.fit_transform(X, y=y, **params)
+        # Delegate to the fit_transform implementation so sparse_output_ is set
+        # from the transformed data and later transform calls keep a consistent
+        # output type. Routing for fit_transform is checked there as well.
+        self._fit_transform(X, y, _callback_task_name="fit", **params)
         return self
 
     @_fit_context(
@@ -954,6 +1004,10 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
             any result is a sparse matrix, everything will be converted to
             sparse matrices.
         """
+        return self._fit_transform(X, y, _callback_task_name="fit-transform", **params)
+
+    def _fit_transform(self, X, y=None, *, _callback_task_name, **params):
+        """Fit transformers and return the concatenated transformed data."""
         _raise_for_params(params, self, "fit_transform")
 
         validate_data(self, X=X, skip_check_array=True)
@@ -970,18 +1024,40 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
         # shaped empty routing in the disabled case.
         routed_params = process_routing(self, "fit_transform", **params)
 
+        fitting_steps = list(
+            self._iter(
+                fitted=False,
+                column_as_labels=False,
+                skip_drop=True,
+                skip_empty_columns=True,
+            )
+        )
+        metadata = _callback_metadata(params)
+        callback_ctx = self._init_callback_context(
+            task_name=_callback_task_name,
+            max_subtasks=len(fitting_steps),
+            sequential_subtasks=False,
+        )
+        callback_ctx.call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata)
+
         result = self._call_func_on_transformers(
             X,
             y,
-            _fit_transform_one,
+            _fit_transform_one_with_callbacks,
             column_as_labels=False,
             routed_params=routed_params,
+            callback_ctx=callback_ctx,
+            metadata=metadata,
         )
 
         if not result:
             self._update_fitted_transformers([])
             # All transformers are None
-            return np.zeros((n_samples, 0))
+            Xt = np.zeros((n_samples, 0))
+            callback_ctx.call_on_fit_task_end(
+                estimator=self, X=Xt, y=y, metadata=metadata
+            )
+            return Xt
 
         Xs, transformers = zip(*result)
 
@@ -1000,7 +1076,9 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
         self._validate_output(Xs)
         self._record_output_indices(Xs)
 
-        return self._hstack(list(Xs), n_samples=n_samples)
+        Xt = self._hstack(list(Xs), n_samples=n_samples)
+        callback_ctx.call_on_fit_task_end(estimator=self, X=Xt, y=y, metadata=metadata)
+        return Xt
 
     def transform(self, X, **params):
         """Transform X separately by each transformer, concatenate results.
