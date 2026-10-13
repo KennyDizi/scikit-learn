@@ -23,26 +23,53 @@ from sklearn.utils.metaestimators import _BaseComposition
 
 
 def _fit_single_estimator(
-    estimator, X, y, fit_params, message_clsname=None, message=None
+    estimator,
+    X,
+    y,
+    fit_params,
+    message_clsname=None,
+    message=None,
+    *,
+    callback_ctx=None,
+    caller=None,
+    metadata=None,
 ):
-    """Private function used to fit an estimator within a job."""
-    # TODO(SLEP6): remove if-condition for unrouted sample_weight when metadata
-    # routing can't be disabled.
-    if not _routing_enabled() and "sample_weight" in fit_params:
-        try:
+    """Private function used to fit an estimator within a job.
+
+    The caller clones ``estimator`` before this function runs. Callbacks are
+    attached here, after that clone, and removed before the fitted estimator is
+    returned. Task end is emitted only when ``fit`` succeeds. A stop request is
+    ignored: this function is one task inside an already dispatched batch.
+    """
+
+    def _fit():
+        # TODO(SLEP6): remove if-condition for unrouted sample_weight when metadata
+        # routing can't be disabled.
+        if not _routing_enabled() and "sample_weight" in fit_params:
+            try:
+                with _print_elapsed_time(message_clsname, message):
+                    estimator.fit(X, y, sample_weight=fit_params["sample_weight"])
+            except TypeError as exc:
+                if "unexpected keyword argument 'sample_weight'" in str(exc):
+                    name = estimator.__class__.__name__
+                    raise TypeError(
+                        f"Underlying estimator {name} does not support sample weights."
+                    ) from exc
+                raise
+        else:
             with _print_elapsed_time(message_clsname, message):
-                estimator.fit(X, y, sample_weight=fit_params["sample_weight"])
-        except TypeError as exc:
-            if "unexpected keyword argument 'sample_weight'" in str(exc):
-                raise TypeError(
-                    "Underlying estimator {} does not support sample weights.".format(
-                        estimator.__class__.__name__
-                    )
-                ) from exc
-            raise
-    else:
-        with _print_elapsed_time(message_clsname, message):
-            estimator.fit(X, y, **fit_params)
+                estimator.fit(X, y, **fit_params)
+
+    if callback_ctx is None:
+        _fit()
+        return estimator
+
+    with callback_ctx.propagate_callback_context(estimator):
+        callback_ctx.call_on_fit_task_begin(
+            estimator=caller, X=X, y=y, metadata=metadata
+        )
+        _fit()
+        callback_ctx.call_on_fit_task_end(estimator=caller, X=X, y=y, metadata=metadata)
     return estimator
 
 

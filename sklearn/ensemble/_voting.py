@@ -21,6 +21,7 @@ from sklearn.base import (
     _fit_context,
     clone,
 )
+from sklearn.callback import CallbackSupportMixin
 from sklearn.ensemble._base import _BaseHeterogeneousEnsemble, _fit_single_estimator
 from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import LabelEncoder
@@ -45,7 +46,7 @@ from sklearn.utils.validation import (
 )
 
 
-class _BaseVoting(TransformerMixin, _BaseHeterogeneousEnsemble):
+class _BaseVoting(CallbackSupportMixin, TransformerMixin, _BaseHeterogeneousEnsemble):
     """Base class for voting.
 
     Warning: This class should not be used directly. Use derived classes
@@ -96,18 +97,44 @@ class _BaseVoting(TransformerMixin, _BaseHeterogeneousEnsemble):
             )
             routed_params = _manual_routing({name: {"fit": sw} for name in names})
 
-        self.estimators_ = Parallel(n_jobs=self.n_jobs)(
+        # Keep the original index so the verbose message stays "(i of n)" over
+        # the full estimator list, including dropped entries.
+        active = [
+            (idx, name, clf)
+            for idx, (name, clf) in enumerate(zip(names, clfs))
+            if clf != "drop"
+        ]
+        metadata = (
+            {"sample_weight": fit_params["sample_weight"]}
+            if "sample_weight" in fit_params
+            else None
+        )
+        callback_ctx = self._init_callback_context(
+            max_subtasks=len(active), sequential_subtasks=False
+        )
+        callback_ctx.call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata)
+        # Subcontexts are built before dispatch. A callback stop request does
+        # not cancel the rest of this batch, and worker-local mutations of the
+        # parent are not merged back.
+        contexts = [
+            callback_ctx.subcontext(task_name=f"fit-{name}", task_id=task_i)
+            for task_i, (_, name, _) in enumerate(active)
+        ]
+        jobs = [
             delayed(_fit_single_estimator)(
                 clone(clf),
                 X,
                 y,
-                fit_params=routed_params[name]["fit"],
+                routed_params[name]["fit"],
                 message_clsname="Voting",
                 message=self._log_message(name, idx + 1, len(clfs)),
+                callback_ctx=contexts[task_i],
+                caller=self,
+                metadata=metadata,
             )
-            for idx, (name, clf) in enumerate(zip(names, clfs))
-            if clf != "drop"
-        )
+            for task_i, (idx, name, clf) in enumerate(active)
+        ]
+        self.estimators_ = Parallel(n_jobs=self.n_jobs)(jobs)
 
         self.named_estimators_ = Bunch()
 
@@ -120,6 +147,7 @@ class _BaseVoting(TransformerMixin, _BaseHeterogeneousEnsemble):
             if hasattr(current_est, "feature_names_in_"):
                 self.feature_names_in_ = current_est.feature_names_in_
 
+        callback_ctx.call_on_fit_task_end(estimator=self, X=X, y=y, metadata=metadata)
         return self
 
     def fit_transform(self, X, y=None, **fit_params):
