@@ -11,7 +11,7 @@ import numpy as np
 from scipy import sparse
 
 from sklearn.base import TransformerMixin, _fit_context, clone
-from sklearn.callback import CallbackSupportMixin
+from sklearn.callback import CallbackSupportMixin, with_callbacks
 from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import FunctionTransformer
 from sklearn.utils import Bunch
@@ -533,8 +533,8 @@ class Pipeline(CallbackSupportMixin, _BaseComposition):
             _fit_transform_one_with_callbacks,
             # caller and callback_ctx are not part of the transformer's fit result.
             # hashing them would break cache hits (Pipeline state / context changes
-            # across fit calls).
-            ignore=["caller", "callback_ctx"],
+            # across fit calls). metadata and propagate only affect callbacks.
+            ignore=["caller", "callback_ctx", "metadata", "propagate"],
         )
 
         for step_idx, name, transformer in self._iter(
@@ -1578,7 +1578,6 @@ def _fit_transform_one(
     return res * weight, transformer
 
 
-# TODO merge with _fit_transform_one when all callers support callbacks
 def _fit_transform_one_with_callbacks(
     transformer,
     X,
@@ -1590,28 +1589,94 @@ def _fit_transform_one_with_callbacks(
     *,
     caller,
     callback_ctx,
+    metadata=None,
+    propagate=True,
 ):
-    with callback_ctx.propagate_callback_context(transformer):
-        callback_ctx.call_on_fit_task_begin(estimator=caller, X=X, y=y)
+    """Fit and transform one step, then emit the task end only on success.
 
-        Xt, transformer = _fit_transform_one(
+    ``propagate=False`` is for steps such as ``"passthrough"`` that are not user
+    estimators. They still record a task, without attaching parent callback state.
+    """
+
+    def _run():
+        callback_ctx.call_on_fit_task_begin(
+            estimator=caller, X=X, y=y, metadata=metadata
+        )
+        Xt, fitted_transformer = _fit_transform_one(
             transformer, X, y, weight, message_clsname, message, params
         )
+        callback_ctx.call_on_fit_task_end(
+            estimator=caller, X=Xt, y=y, metadata=metadata
+        )
+        return Xt, fitted_transformer
 
-        callback_ctx.call_on_fit_task_end(estimator=caller, X=Xt, y=y)
+    if not propagate:
+        return _run()
 
-    return Xt, transformer
+    # Cleanup of propagated callbacks and `_parent_callback_ctx` runs even when
+    # the transformer raises, so reusable estimators stay fit-able.
+    with callback_ctx.propagate_callback_context(transformer):
+        return _run()
 
 
-def _fit_one(transformer, X, y, weight, message_clsname="", message=None, params=None):
+def _fit_one(
+    transformer,
+    X,
+    y,
+    weight,
+    message_clsname="",
+    message=None,
+    params=None,
+    *,
+    caller=None,
+    callback_ctx=None,
+    metadata=None,
+    propagate=True,
+):
+    """Fit ``transformer`` to ``X`` and ``y``.
+
+    When ``callback_ctx`` is provided, task end is emitted only after ``fit``
+    returns. Propagated callback state is removed before the fitted transformer
+    is returned to the parent process.
     """
-    Fits ``transformer`` to ``X`` and ``y``.
-    """
-    with _print_elapsed_time(message_clsname, message):
-        return transformer.fit(X, y, **params["fit"])
+    params = params or {}
+
+    def _fit():
+        with _print_elapsed_time(message_clsname, message):
+            transformer.fit(X, y, **params["fit"])
+
+    if callback_ctx is None:
+        _fit()
+        return transformer
+
+    if not propagate:
+        callback_ctx.call_on_fit_task_begin(
+            estimator=caller, X=X, y=y, metadata=metadata
+        )
+        _fit()
+        callback_ctx.call_on_fit_task_end(estimator=caller, X=X, y=y, metadata=metadata)
+        return transformer
+
+    with callback_ctx.propagate_callback_context(transformer):
+        callback_ctx.call_on_fit_task_begin(
+            estimator=caller, X=X, y=y, metadata=metadata
+        )
+        _fit()
+        callback_ctx.call_on_fit_task_end(estimator=caller, X=X, y=y, metadata=metadata)
+    return transformer
 
 
-class FeatureUnion(TransformerMixin, _BaseComposition):
+def _callback_metadata(params):
+    """Return callback metadata for ``sample_weight`` when it was provided."""
+    if not params:
+        return None
+    sample_weight = params.get("sample_weight")
+    if sample_weight is None:
+        return None
+    return {"sample_weight": sample_weight}
+
+
+class FeatureUnion(CallbackSupportMixin, TransformerMixin, _BaseComposition):
     """Concatenates results of multiple transformer objects.
 
     This estimator applies a list of transformer objects in parallel to the
@@ -1922,6 +1987,60 @@ class FeatureUnion(TransformerMixin, _BaseComposition):
             [name for _, name in transformer_with_feature_names_out],
         )
 
+    def _fitting_steps(self):
+        """Return the transformers that ``fit`` will run, in dispatch order.
+
+        ``"drop"`` steps are omitted. ``"passthrough"`` is turned into a
+        ``FunctionTransformer`` and is not a propagation target: it has no user
+        callbacks to keep, and warning about it would be noise.
+        """
+        self.transformer_list = list(self.transformer_list)
+        self._validate_transformers()
+        self._validate_transformer_weights()
+
+        get_weight = (self.transformer_weights or {}).get
+        steps = []
+        for name, trans in self.transformer_list:
+            if trans == "drop":
+                continue
+            propagate = trans != "passthrough"
+            if not propagate:
+                trans = FunctionTransformer(feature_names_out="one-to-one")
+            steps.append((name, trans, get_weight(name), propagate))
+        return steps
+
+    def _dispatch_steps(self, X, y, func, routed_params, steps, callback_ctx, metadata):
+        """Fit each step. Subcontexts are created before the batch is dispatched.
+
+        A stop request returned by ``on_fit_task_end`` is advisory: siblings that
+        already belong to this batch are not cancelled, and worker-local callback
+        state is not merged back into the parent.
+        """
+        contexts = [
+            callback_ctx.subcontext(
+                task_name=f"{callback_ctx.task_name}-{name}", task_id=idx
+            )
+            for idx, (name, _, _, _) in enumerate(steps)
+        ]
+        jobs = [
+            delayed(func)(
+                transformer,
+                X,
+                y,
+                weight,
+                message_clsname="FeatureUnion",
+                message=self._log_message(name, idx + 1, len(steps)),
+                params=routed_params[name],
+                caller=self,
+                callback_ctx=contexts[idx],
+                metadata=metadata,
+                propagate=propagate,
+            )
+            for idx, (name, transformer, weight, propagate) in enumerate(steps)
+        ]
+        return Parallel(n_jobs=self.n_jobs)(jobs)
+
+    @with_callbacks
     def fit(self, X, y=None, **fit_params):
         """Fit all transformers using X.
 
@@ -1959,15 +2078,24 @@ class FeatureUnion(TransformerMixin, _BaseComposition):
                 {name: {"fit": fit_params} for name, _ in self.transformer_list}
             )
 
-        transformers = self._parallel_func(X, y, _fit_one, routed_params)
+        steps = self._fitting_steps()
+        metadata = _callback_metadata(fit_params)
+        callback_ctx = self._init_callback_context(
+            task_name="fit",
+            max_subtasks=len(steps),
+            sequential_subtasks=False,
+        )
+        callback_ctx.call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata)
+        transformers = self._dispatch_steps(
+            X, y, _fit_one, routed_params, steps, callback_ctx, metadata
+        )
 
-        if not transformers:
-            # All transformers are None
-            return self
-
-        self._update_transformer_list(transformers)
+        if transformers:
+            self._update_transformer_list(transformers)
+        callback_ctx.call_on_fit_task_end(estimator=self, X=X, y=y, metadata=metadata)
         return self
 
+    @with_callbacks
     def fit_transform(self, X, y=None, **params):
         """Fit all transformers, transform the data and concatenate results.
 
@@ -2012,41 +2140,38 @@ class FeatureUnion(TransformerMixin, _BaseComposition):
                 }
             )
 
-        results = self._parallel_func(X, y, _fit_transform_one, routed_params)
+        steps = self._fitting_steps()
+        metadata = _callback_metadata(params)
+        callback_ctx = self._init_callback_context(
+            task_name="fit-transform",
+            max_subtasks=len(steps),
+            sequential_subtasks=False,
+        )
+        callback_ctx.call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata)
+        results = self._dispatch_steps(
+            X,
+            y,
+            _fit_transform_one_with_callbacks,
+            routed_params,
+            steps,
+            callback_ctx,
+            metadata,
+        )
         if not results:
             # All transformers are None
             xp, _, device = get_namespace_and_device(X)
-            return xp.zeros((X.shape[0], 0), device=device)
-
-        Xs, transformers = zip(*results)
-        self._update_transformer_list(transformers)
-
-        return self._hstack(Xs)
+            Xt = xp.zeros((X.shape[0], 0), device=device)
+        else:
+            Xs, transformers = zip(*results)
+            self._update_transformer_list(transformers)
+            Xt = self._hstack(Xs)
+        callback_ctx.call_on_fit_task_end(estimator=self, X=Xt, y=y, metadata=metadata)
+        return Xt
 
     def _log_message(self, name, idx, total):
         if not self.verbose:
             return None
         return "(step %d of %d) Processing %s" % (idx, total, name)
-
-    def _parallel_func(self, X, y, func, routed_params):
-        """Runs func in parallel on X and y"""
-        self.transformer_list = list(self.transformer_list)
-        self._validate_transformers()
-        self._validate_transformer_weights()
-        transformers = list(self._iter())
-
-        return Parallel(n_jobs=self.n_jobs)(
-            delayed(func)(
-                transformer,
-                X,
-                y,
-                weight,
-                message_clsname="FeatureUnion",
-                message=self._log_message(name, idx, len(transformers)),
-                params=routed_params[name],
-            )
-            for idx, (name, transformer, weight) in enumerate(transformers, 1)
-        )
 
     def transform(self, X, **params):
         """Transform X separately by each transformer, concatenate results.
