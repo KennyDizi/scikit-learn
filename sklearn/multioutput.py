@@ -23,6 +23,7 @@ from sklearn.base import (
     clone,
     is_classifier,
 )
+from sklearn.callback import CallbackSupportMixin
 from sklearn.model_selection import cross_val_predict
 from sklearn.utils import check_random_state, get_tags
 from sklearn.utils._param_validation import HasMethods, StrOptions
@@ -56,12 +57,41 @@ __all__ = [
 ]
 
 
-def _fit_estimator(estimator, X, y, sample_weight=None, **fit_params):
+def _fit_estimator(
+    estimator, X, y, sample_weight=None, *, _callback=None, **fit_params
+):
+    """Clone, fit, and optionally run one callback task.
+
+    Cloning happens before callbacks are attached so the template estimator
+    stored on the parent is reusable. Task end is emitted only after ``fit``
+    succeeds. Stop requests are not acted on: the output tasks are one batch.
+
+    ``_callback`` is ``(callback_ctx, caller, metadata)`` or None. It is not
+    passed through ``**fit_params`` so a routed parameter named ``metadata``
+    still reaches ``estimator.fit``.
+    """
     estimator = clone(estimator)
-    if sample_weight is not None:
-        estimator.fit(X, y, sample_weight=sample_weight, **fit_params)
+    if _callback is None:
+        callback_ctx, caller, metadata = None, None, None
     else:
-        estimator.fit(X, y, **fit_params)
+        callback_ctx, caller, metadata = _callback
+
+    def _fit_cloned():
+        if sample_weight is not None:
+            estimator.fit(X, y, sample_weight=sample_weight, **fit_params)
+        else:
+            estimator.fit(X, y, **fit_params)
+
+    if callback_ctx is None:
+        _fit_cloned()
+        return estimator
+
+    with callback_ctx.propagate_callback_context(estimator):
+        callback_ctx.call_on_fit_task_begin(
+            estimator=caller, X=X, y=y, metadata=metadata
+        )
+        _fit_cloned()
+        callback_ctx.call_on_fit_task_end(estimator=caller, X=X, y=y, metadata=metadata)
     return estimator
 
 
@@ -97,7 +127,9 @@ def _available_if_estimator_has(attr):
     return available_if(_check)
 
 
-class _MultiOutputEstimator(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
+class _MultiOutputEstimator(
+    CallbackSupportMixin, MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta
+):
     _parameter_constraints: dict = {
         "estimator": [HasMethods(["fit", "predict"])],
         "n_jobs": [Integral, None],
@@ -266,18 +298,43 @@ class _MultiOutputEstimator(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta
                 fit_kwargs["sample_weight"] = sample_weight
             routed_params = _manual_routing({"estimator": {"fit": fit_kwargs}})
 
-        self.estimators_ = Parallel(n_jobs=self.n_jobs)(
-            delayed(_fit_estimator)(
-                self.estimator, X, y[:, i], **routed_params.estimator.fit
-            )
-            for i in range(y.shape[1])
+        n_outputs = y.shape[1]
+        metadata = None
+        if sample_weight is not None:
+            metadata = {"sample_weight": sample_weight}
+        callback_ctx = self._init_callback_context(
+            max_subtasks=n_outputs, sequential_subtasks=False
         )
+        callback_ctx.call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata)
+        # Register every output task before dispatch so pickling the parent
+        # does not race with context-tree updates. Stop requests do not cancel
+        # siblings that were already submitted.
+        contexts = [
+            callback_ctx.subcontext(task_name=f"fit-output-{i}", task_id=i)
+            for i in range(n_outputs)
+        ]
+        jobs = [
+            delayed(_fit_estimator)(
+                self.estimator,
+                X,
+                y[:, i],
+                _callback=(contexts[i], self, metadata),
+                **routed_params.estimator.fit,
+            )
+            for i in range(n_outputs)
+        ]
+        self.estimators_ = Parallel(n_jobs=self.n_jobs)(jobs)
 
         if hasattr(self.estimators_[0], "n_features_in_"):
             self.n_features_in_ = self.estimators_[0].n_features_in_
         if hasattr(self.estimators_[0], "feature_names_in_"):
             self.feature_names_in_ = self.estimators_[0].feature_names_in_
+        # `classes_` has to exist before the root end hook. Teardown runs when
+        # this method returns, so it sees the same fitted classifier state.
+        if is_classifier(self):
+            self.classes_ = [est.classes_ for est in self.estimators_]
 
+        callback_ctx.call_on_fit_task_end(estimator=self, X=X, y=y, metadata=metadata)
         return self
 
     def predict(self, X):
