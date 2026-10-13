@@ -19,7 +19,7 @@ API or give up cross-process capabilities.
 import os
 import weakref
 from multiprocessing.connection import Client, Connection, Listener
-from threading import Thread
+from threading import Lock, Thread
 from typing import Callable, NamedTuple
 
 
@@ -62,7 +62,12 @@ _message_consumers: dict[str, Callable] = {}
 # Worker-side cache of client connections back to the main-process listeners, keyed by
 # listener address. The first cross-process send opens a client. Subsequent sends to the
 # same listener reuse the cached connection.
+#
+# A process worker can itself run several threads (nested thread backend). Those threads
+# share this cache, so each connection has a lock that keeps send/recv pairs intact.
 _worker_connections: dict[str, Connection] = {}
+_worker_connection_locks: dict[str, Lock] = {}
+_worker_connections_guard = Lock()
 
 
 def open_listener(message_consumer, *, owner=None):
@@ -170,16 +175,28 @@ def send(listener_handle, message):
       in `_worker_connections`, so all subsequent messages reuse the same socket.
       `send` then waits for an acknowledgement from the main process so that, by
       the time it returns, the message has actually been processed by the consumer.
+      Threads that share a worker process take turns on that connection.
     """
     message_consumer = _message_consumers.get(listener_handle.address)
     if message_consumer is not None:  # fast path
         message_consumer(message)
         return
 
+    connection, lock = _worker_connection(listener_handle)
+    # One thread at a time: interleaved send/recv on a shared socket corrupts
+    # the acknowledgement stream.
+    with lock:
+        connection.send(message)
+        connection.recv()
+
+
+def _worker_connection(listener_handle):
+    """Return the cached client connection for ``listener_handle`` and its lock."""
     address = listener_handle.address
-    connection = _worker_connections.get(address)
-    if connection is None:
-        connection = Client(address, authkey=listener_handle.authkey)
-        _worker_connections[address] = connection
-    connection.send(message)
-    connection.recv()
+    with _worker_connections_guard:
+        connection = _worker_connections.get(address)
+        if connection is None:
+            connection = Client(address, authkey=listener_handle.authkey)
+            _worker_connections[address] = connection
+            _worker_connection_locks[address] = Lock()
+        return connection, _worker_connection_locks[address]
